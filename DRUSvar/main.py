@@ -42,6 +42,10 @@ def parse_args_and_config():
         help="the index [1:9] of the multiplicative noise map for numerical experiments in EUSIPCO2024"
     )
     parser.add_argument(
+        "--data_dir", type=str, default=None,
+        help="Path to the directory containing input images for restoration."
+    )
+    parser.add_argument(
         "--timesteps", type=int, default=50, help="number of steps involved"
     )
     parser.add_argument(

@@ -147,7 +147,60 @@ class Diffusion(object):
         elif args.deg[:4] == "DENO":  # apply on the PICMUS dataset with simple denoising (BH \approx Identity)
             from functions.svd_replacement import Denoising
             H_funcs = Denoising(config.data.channels, config.data.image_size, self.device)
-        elif args.deg in ["NumericalCysts", "NumericalScatterers"]:  # apply on the numerical dataset (Cysts and Scatterers) degraded with a 2D blurring kernel
+        def sample_sequence(self, model, cls_fn=None):
+        from torchvision.utils import save_image
+        from torchvision import transforms
+        from PIL import Image
+        import glob
+        
+        args, config = self.args, self.config
+        
+        # Check if the new data_dir argument is provided
+        if not args.data_dir:
+            raise ValueError("A data directory must be provided with --data_dir")
+
+        print(f"Loading images from: {args.data_dir}")
+        # Get all PNG files from the data directory
+        image_paths = sorted(glob.glob(os.path.join(args.data_dir, '*.png')))
+        if not image_paths:
+            raise ValueError(f"No PNG images found in {args.data_dir}")
+
+        print(f"Found {len(image_paths)} images to process.")
+
+        # Define output directory for restored images
+        resultsPath = os.path.join(os.path.dirname(args.exp), "drus_restoration_outputs", args.deg)
+        os.makedirs(resultsPath, exist_ok=True)
+        print(f"Results will be saved to: {resultsPath}")
+
+        # Define image transformations
+        transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((config.data.image_size, config.data.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])  # Scale to [-1, 1]
+        ])
+
+        # ** get SVD results of the model matrix **
+        # This part STILL requires the .mat files generated from MATLAB.
+        print(f'Loading the SVD of the degradation matrix (' + args.deg + ')')
+        if args.deg[:4] == "DRUS":
+            from functions.svd_replacement import ultrasound0
+            # The user must run the generated MATLAB script to create these files.
+            svdPath = os.path.join(args.matlab_path, 'picmus', 'SVD')
+            print(f"Expecting SVD files in: {svdPath}")
+            try:
+                Up = torch.from_numpy(mat73.loadmat(os.path.join(svdPath, 'Ud.mat'))['Ud'])
+                lbdp = torch.from_numpy(mat73.loadmat(os.path.join(svdPath, 'Sigma.mat'))['Sigma'])
+                Vp = torch.from_numpy(mat73.loadmat(os.path.join(svdPath, 'Vd.mat'))['Vd'])
+            except FileNotFoundError as e:
+                print(f"ERROR: SVD .mat file not found. Please run the 'generate_svd_matrix.m' script in MATLAB first.")
+                print(f"Details: {e}")
+                quit()
+            H_funcs = ultrasound0(config.data.channels, Up, lbdp, Vp, self.device)
+        elif args.deg[:4] == "DENO":
+            from functions.svd_replacement import Denoising
+            H_funcs = Denoising(config.data.channels, config.data.image_size, self.device)
+        elif args.deg in ["NumericalCysts", "NumericalScatterers"]:
             from functions.svd_replacement import Deblurring2D
             sigma = 1.2
             kerHalfLen = ceil(2 * sigma)
@@ -157,6 +210,53 @@ class Diffusion(object):
             pdf = lambda x: torch.cos(torch.Tensor([2*pi*0.5*x])) * torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
             kernel1 = torch.Tensor([pdf(i) for i in range(-kerHalfLen, 0, 1)] + [pdf(i) for i in range(kerHalfLen+1)]).to(self.device)
             H_funcs = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, config.data.image_size, self.device)
+        else:
+            print(f"ERROR: the degradation model type '{args.deg}' is not supported")
+            quit()
+
+        # Set a default noise level (gamma). This can be made a command-line argument if needed.
+        # This value is an example; you may need to adjust it.
+        gamma = self.args.gamma if hasattr(self.args, 'gamma') else 0.1
+
+        print(f'Start restoration for {len(image_paths)} images...')
+        for i, img_path in enumerate(image_paths):
+            print(f"Processing image {i+1}/{len(image_paths)}: {os.path.basename(img_path)}")
+            
+            # Load the ground truth image
+            x_orig_pil = Image.open(img_path)
+            x_orig = transform(x_orig_pil).to(self.device)
+            x_orig = x_orig.unsqueeze(0) # Add batch dimension
+
+            # Simulate the degradation process to get the observation y_0
+            with torch.no_grad():
+                y_0 = H_funcs.H(x_orig)
+                
+                # Add noise
+                noise = torch.randn_like(y_0) * gamma
+                y_0 += noise
+
+            # ===========================================================================================================
+            # ** Begin DDRM **
+            x = torch.randn(
+                y_0.shape[0],
+                config.data.channels,
+                config.data.image_size,
+                config.data.image_size,
+                device=self.device,
+            )
+            
+            with torch.no_grad():
+                x_restored, _ = self.sample_image(x, model, H_funcs, y_0, gamma, last=False, cls_fn=cls_fn, timesteps=args.timesteps)
+            
+            # Save the restored image as a PNG file
+            output_filename = os.path.join(resultsPath, f"{os.path.splitext(os.path.basename(img_path))[0]}_restored.png")
+            
+            # Normalize the output tensor to [0, 1] for saving
+            restored_image = (x_restored[-1][0].detach().cpu() + 1) / 2
+            restored_image = torch.clamp(restored_image, 0, 1)
+
+            save_image(restored_image, output_filename)
+            print(f'Finish {i+1}/{len(image_paths)}. Saved to {output_filename}')
         else:
             print("ERROR: the degradation model type (--deg) is not supported")
             quit()
